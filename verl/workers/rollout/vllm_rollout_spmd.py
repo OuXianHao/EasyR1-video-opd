@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 import os
 from contextlib import contextmanager
 from typing import Any, Optional, Union
@@ -22,6 +23,7 @@ import torch.distributed
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from vllm import LLM, RequestOutput, SamplingParams
+from vllm.engine.arg_utils import EngineArgs
 from vllm.lora.request import LoRARequest
 
 from ...protocol import DataProto
@@ -118,9 +120,15 @@ class vLLMRollout(BaseRollout):
 
         engine_kwargs = {}
         if processor is not None:  # only VLMs have processor
-            engine_kwargs["disable_mm_preprocessor_cache"] = True
+            # vLLM 0.14 renamed the option; both forms disable multimodal processor caching.
+            if "mm_processor_cache_gb" in inspect.signature(EngineArgs).parameters:
+                engine_kwargs["mm_processor_cache_gb"] = 0
+            else:
+                engine_kwargs["disable_mm_preprocessor_cache"] = True
             if config.limit_images:
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
+            if os.getenv("EASYR1_VIDEO_OPD_PREPROCESS") == "1":
+                engine_kwargs["mm_processor_kwargs"] = {"do_resize": False}
 
         VLLMHijack.hijack()
 
@@ -153,6 +161,9 @@ class vLLMRollout(BaseRollout):
             "detokenize": False,
             "logit_bias": _get_logit_bias(processor),
         }
+        self.capture_sampled_logprobs = os.getenv("EASYR1_CAPTURE_VLLM_LOGPROBS") == "1"
+        if self.capture_sampled_logprobs:
+            sampling_kwargs["logprobs"] = 1
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
             if hasattr(default_sampling_params, key):
@@ -207,6 +218,13 @@ class vLLMRollout(BaseRollout):
                         ),
                     }
                 )
+            if self.capture_sampled_logprobs and self.rank == 0:
+                for item in vllm_inputs:
+                    video_data = item["multi_modal_data"].get("video") if item["multi_modal_data"] else None
+                    if video_data:
+                        first_video = video_data[0]
+                        video_tensor = first_video[0] if isinstance(first_video, tuple) else first_video
+                        print(f"VIDEO_OPD_ROLLOUT_FRAMES={video_tensor.shape[0]}", flush=True)
         else:
             vllm_inputs = [{"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in batch_raw_prompt_ids]
 
@@ -227,10 +245,26 @@ class vLLMRollout(BaseRollout):
                 lora_request=lora_requests,
                 use_tqdm=self.use_tqdm,
             )
-            response_ids = [output.token_ids for completion in completions for output in completion.outputs]
+            response_outputs = [output for completion in completions for output in completion.outputs]
+            response_ids = [output.token_ids for output in response_outputs]
+            if self.capture_sampled_logprobs:
+                sampled_logprobs = []
+                for output in response_outputs:
+                    if output.logprobs is None or len(output.logprobs) != len(output.token_ids):
+                        raise RuntimeError("vLLM did not return one logprob per sampled token.")
+                    values = []
+                    for token_id, alternatives in zip(output.token_ids, output.logprobs):
+                        if token_id not in alternatives:
+                            raise RuntimeError(f"vLLM omitted sampled token {token_id} from logprobs.")
+                        values.append(alternatives[token_id].logprob)
+                    sampled_logprobs.append(values)
             response_ids = VF.pad_2d_list_to_length(
                 response_ids, self.pad_token_id, max_length=self.config.response_length
             ).to(input_ids.device)
+            if self.capture_sampled_logprobs:
+                vllm_log_probs = torch.zeros_like(response_ids, dtype=torch.float32)
+                for row_index, values in enumerate(sampled_logprobs):
+                    vllm_log_probs[row_index, :len(values)] = torch.tensor(values, dtype=torch.float32, device=input_ids.device)
 
             if self.sampling_params.n > 1:
                 batch_size = batch_size * self.sampling_params.n
@@ -269,6 +303,8 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
+        if self.capture_sampled_logprobs:
+            batch["vllm_log_probs"] = vllm_log_probs
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:

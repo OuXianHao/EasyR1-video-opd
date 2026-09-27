@@ -59,7 +59,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.world_size = dist.get_world_size()
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
-        self.tp_group = vllm_ps.get_tensor_model_parallel_group().device_group
+        # vLLM 0.14 renamed this accessor; the returned device process group is unchanged.
+        tp_coordinator = (
+            vllm_ps.get_tp_group()
+            if hasattr(vllm_ps, "get_tp_group")
+            else vllm_ps.get_tensor_model_parallel_group()
+        )
+        self.tp_group = tp_coordinator.device_group
 
         # Record freed bytes to estimate memory usage correctly
         # https://github.com/vllm-project/vllm/pull/11743#issuecomment-2754338119

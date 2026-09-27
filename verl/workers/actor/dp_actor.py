@@ -16,6 +16,7 @@ Implement Actor
 """
 
 import os
+import time
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -28,6 +29,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from ...protocol import DataProto, batch_collate
 from ...trainer.core_algos import average_loss, compute_kl, compute_policy_loss
+from ...trainer.opd import compute_opd_loss
 from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
 from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
@@ -217,6 +219,8 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     def update_policy(self, data: DataProto) -> dict[str, Any]:
+        if self.config.opd_enabled:
+            return self._update_policy_opd(data)
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
@@ -294,4 +298,118 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
+        return metrics
+
+    def _update_policy_opd(self, data: DataProto) -> dict[str, Any]:
+        """One rollout batch, one unclipped sampled-token OPD optimizer step."""
+        required = ("responses", "response_mask", "old_log_probs", "teacher_log_probs")
+        for key in required:
+            if key not in data.batch:
+                raise ValueError(f"Vanilla OPD requires {key} in the actor batch.")
+        responses = data.batch["responses"]
+        if any(data.batch[key].shape != responses.shape for key in required[1:]):
+            raise ValueError("OPD Teacher, old policy, response, and mask shapes differ.")
+        if len(data) != self.config.global_batch_size_per_device:
+            raise ValueError("Vanilla OPD requires exactly one actor mini-batch per rollout batch.")
+        if self.config.ppo_epochs != 1:
+            raise ValueError("Vanilla OPD requires exactly one actor optimizer step per rollout batch.")
+
+        self.actor_module.train()
+        temperature = data.meta_info["temperature"]
+        selected = data.select(
+            ["input_ids", "attention_mask", "position_ids", *required], ["multi_modal_inputs"]
+        )
+        total_tokens = selected.batch["response_mask"].sum().to(torch.float32)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
+        if total_tokens.item() <= 0:
+            raise ValueError("Vanilla OPD requires valid response tokens.")
+
+        if self.config.dynamic_batching:
+            max_tokens = self.config.micro_batch_size_per_device_for_update * selected.batch["input_ids"].size(-1)
+            micro_batches, _ = prepare_dynamic_batch(selected, max_token_len=max_tokens)
+        else:
+            micro_batches = selected.split(self.config.micro_batch_size_per_device_for_update)
+
+        # All sums are reduced across data-parallel ranks before logging.
+        sums = torch.zeros(9, device=responses.device, dtype=torch.float64)
+        ratio_min = torch.tensor(float("inf"), device=responses.device)
+        ratio_max = torch.tensor(float("-inf"), device=responses.device)
+        diagnose_timing = os.getenv("EASYR1_OPD_TIMING") == "1"
+        forward_s = backward_s = 0.0
+        for micro_batch in micro_batches:
+            model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+            if diagnose_timing:
+                torch.cuda.synchronize()
+                started = time.monotonic()
+            log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
+            loss, reward, ratio = compute_opd_loss(
+                log_probs=log_probs,
+                old_log_probs=model_inputs["old_log_probs"],
+                teacher_log_probs=model_inputs["teacher_log_probs"],
+                response_mask=model_inputs["response_mask"],
+            )
+            mask = model_inputs["response_mask"].bool()
+            count = mask.sum()
+            # FSDP averages gradients across ranks; restore a global valid-token mean.
+            if diagnose_timing:
+                torch.cuda.synchronize()
+                forward_s += time.monotonic() - started
+                started = time.monotonic()
+            (loss * count * self.world_size / total_tokens).backward()
+            if diagnose_timing:
+                torch.cuda.synchronize()
+                backward_s += time.monotonic() - started
+            valid_reward = reward[mask].detach()
+            valid_ratio = ratio[mask].detach()
+            sums += torch.stack(
+                (
+                    loss.detach() * count,
+                    valid_reward.sum(),
+                    valid_reward.double().square().sum(),
+                    (valid_reward > 0).sum(),
+                    (valid_reward < 0).sum(),
+                    model_inputs["teacher_log_probs"][mask].detach().sum(),
+                    model_inputs["old_log_probs"][mask].detach().sum(),
+                    valid_ratio.sum(),
+                    valid_reward.abs().sum(),
+                )
+            ).to(torch.float64)
+            ratio_min = torch.minimum(ratio_min, valid_ratio.min())
+            ratio_max = torch.maximum(ratio_max, valid_ratio.max())
+
+        if diagnose_timing:
+            torch.cuda.synchronize()
+            started = time.monotonic()
+        grad_norm = self._optimizer_step()
+        optimizer_s = 0.0
+        if diagnose_timing:
+            torch.cuda.synchronize()
+            optimizer_s = time.monotonic() - started
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(ratio_min, op=dist.ReduceOp.MIN)
+        dist.all_reduce(ratio_max, op=dist.ReduceOp.MAX)
+        count = total_tokens.item()
+        reward_mean = (sums[1] / count).item()
+        metrics = {
+            "opd/loss": (sums[0] / count).item(),
+            "opd/reward_mean": reward_mean,
+            "opd/reward_std": max(0.0, (sums[2] / count).item() - reward_mean**2) ** 0.5,
+            "opd/reward_positive_frac": (sums[3] / count).item(),
+            "opd/reward_negative_frac": (sums[4] / count).item(),
+            "opd/teacher_logprob_mean": (sums[5] / count).item(),
+            "opd/old_logprob_mean": (sums[6] / count).item(),
+            "opd/ratio_mean": (sums[7] / count).item(),
+            "opd/ratio_min": ratio_min.item(),
+            "opd/ratio_max": ratio_max.item(),
+            "opd/valid_tokens": int(count),
+            "opd/teacher_student_gap_abs_mean": (sums[8] / count).item(),
+            "opd/optimizer_step": int(torch.isfinite(grad_norm).item()),
+            "actor/grad_norm": grad_norm.detach().item(),
+        }
+        if diagnose_timing:
+            metrics.update({
+                "opd/forward_time_s": forward_s,
+                "opd/backward_time_s": backward_s,
+                "opd/optimizer_time_s": optimizer_s,
+            })
         return metrics

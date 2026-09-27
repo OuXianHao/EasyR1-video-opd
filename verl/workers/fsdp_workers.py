@@ -15,6 +15,7 @@
 The main entry point to run the PPO algorithm
 """
 
+import os
 from contextlib import nullcontext
 from typing import Literal, Optional, Union, cast
 
@@ -95,6 +96,7 @@ class FSDPWorker(Worker):
 
         if self.config.actor.disable_kl:
             self._has_ref = False
+        self._has_teacher = self._has_actor and self.config.actor.opd_enabled
 
         self._lora_rank = self.config.actor.model.lora.rank
         self._is_lora = self._lora_rank > 0
@@ -102,6 +104,7 @@ class FSDPWorker(Worker):
         self._use_param_offload = False
         self._use_optimizer_offload = False
         self._use_ref_param_offload = False
+        self._use_teacher_param_offload = False
         if self._has_actor:
             self._use_param_offload = self.config.actor.offload.offload_params
             self._use_optimizer_offload = self.config.actor.offload.offload_optimizer
@@ -114,6 +117,53 @@ class FSDPWorker(Worker):
 
         if self._has_ref:  # NOTE: it seems that manual offload is slower than FSDP offload
             self._use_ref_param_offload = self.config.ref.offload.offload_params
+        if self._has_teacher:
+            self._use_teacher_param_offload = self.config.teacher.offload.offload_params
+
+    def _validate_teacher_compatibility(self, teacher_config: ModelConfig) -> None:
+        """The stored student token IDs and visual layout must also be valid teacher inputs."""
+        self.teacher_tokenizer = get_tokenizer(
+            teacher_config.tokenizer_path, trust_remote_code=teacher_config.trust_remote_code, use_fast=True
+        )
+        self.teacher_processor = get_processor(
+            teacher_config.tokenizer_path, trust_remote_code=teacher_config.trust_remote_code, use_fast=True
+        )
+        self.teacher_model_config = AutoConfig.from_pretrained(
+            teacher_config.model_path,
+            trust_remote_code=teacher_config.trust_remote_code,
+            bos_token_id=self.teacher_tokenizer.bos_token_id,
+            eos_token_id=self.teacher_tokenizer.eos_token_id,
+            pad_token_id=self.teacher_tokenizer.pad_token_id,
+            **teacher_config.override_config,
+        )
+        if self.tokenizer.get_vocab() != self.teacher_tokenizer.get_vocab():
+            raise ValueError("OPD requires identical student and teacher token ID mappings.")
+        for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+            if getattr(self.tokenizer, name) != getattr(self.teacher_tokenizer, name):
+                raise ValueError(f"OPD student/teacher {name} differs.")
+        if self.model_config.model_type != self.teacher_model_config.model_type:
+            raise ValueError("OPD student/teacher model types differ.")
+        if (self.processor is None) != (self.teacher_processor is None):
+            raise ValueError("OPD student/teacher multimodal processor availability differs.")
+        if self.processor is not None:
+            if type(self.processor) is not type(self.teacher_processor):
+                raise ValueError("OPD student/teacher processor classes differ.")
+            for name in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"):
+                if getattr(self.processor, name, None) != getattr(self.teacher_processor, name, None):
+                    raise ValueError(f"OPD student/teacher {name} differs.")
+            for name in ("image_processor", "video_processor"):
+                student_part = getattr(self.processor, name, None)
+                teacher_part = getattr(self.teacher_processor, name, None)
+                if (student_part is None) != (teacher_part is None) or (
+                    student_part is not None and student_part.to_dict() != teacher_part.to_dict()
+                ):
+                    raise ValueError(f"OPD student/teacher {name} preprocessing differs.")
+            # Qwen3-VL's visual token expansion and mRoPE depend on these values.
+            for name in ("patch_size", "spatial_merge_size", "temporal_patch_size"):
+                if getattr(self.model_config.vision_config, name, None) != getattr(
+                    self.teacher_model_config.vision_config, name, None
+                ):
+                    raise ValueError(f"OPD student/teacher vision {name} differs.")
 
     def _init_dist_mesh(self, config: Union[ActorConfig, CriticConfig], role: Literal["actor", "critic"]):
         world_size = dist.get_world_size()
@@ -162,9 +212,12 @@ class FSDPWorker(Worker):
         fsdp_config: FSDPConfig,
         optim_config: Optional[OptimConfig],
         padding_free: bool,
-        role: Literal["actor", "critic", "ref"],
+        role: Literal["actor", "critic", "ref", "teacher"],
     ) -> None:
-        if role != "ref":  # ref model's tokenizer is same as actor
+        if role == "teacher":
+            self._validate_teacher_compatibility(model_config)
+            hf_config = self.teacher_model_config
+        elif role != "ref":  # ref model's tokenizer is same as actor
             self.tokenizer = get_tokenizer(
                 model_config.tokenizer_path,
                 trust_remote_code=model_config.trust_remote_code,
@@ -190,19 +243,22 @@ class FSDPWorker(Worker):
                 self.generation_config = GenerationConfig.from_model_config(self.model_config)
 
             self.print_rank0(f"Model config: {self.model_config}")
+            hf_config = self.model_config
+        else:
+            hf_config = self.model_config
 
         if padding_free:
-            apply_ulysses_patch(self.model_config.model_type)
+            apply_ulysses_patch(hf_config.model_type)
             self.print_rank0("Ulysses patch applied!")
 
         if fsdp_config.torch_dtype is None:
-            torch_dtype = torch.float32 if role != "ref" else torch.bfloat16
+            torch_dtype = torch.float32 if role in ("actor", "critic") else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(fsdp_config.torch_dtype)
 
         if role == "critic":
             AutoClass = AutoModelForTokenClassification
-        elif type(self.model_config) in AutoModelForImageTextToText._model_mapping.keys():
+        elif type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
             AutoClass = AutoModelForImageTextToText
         else:
             AutoClass = AutoModelForCausalLM
@@ -210,7 +266,7 @@ class FSDPWorker(Worker):
         if (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0:
             model = AutoClass.from_pretrained(
                 model_config.model_path,
-                config=self.model_config,
+                config=hf_config,
                 torch_dtype=torch_dtype,
                 attn_implementation="flash_attention_2",
                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
@@ -220,7 +276,7 @@ class FSDPWorker(Worker):
         else:
             with no_init_weights(), init_empty_weights():
                 model = AutoClass.from_config(
-                    self.model_config,
+                    hf_config,
                     torch_dtype=torch_dtype,
                     attn_implementation="flash_attention_2",
                     trust_remote_code=model_config.trust_remote_code,
@@ -229,7 +285,7 @@ class FSDPWorker(Worker):
         model = cast(PreTrainedModel, model)  # lint
         model.tie_weights()  # avoid hanging
 
-        if role == "ref":
+        if role in ("ref", "teacher"):
             model.requires_grad_(False)
 
         is_lora_model = self._is_lora and role == "actor"
@@ -257,7 +313,7 @@ class FSDPWorker(Worker):
         else:
             model = model.to(torch_dtype)
 
-        if model_config.enable_gradient_checkpointing:
+        if model_config.enable_gradient_checkpointing and role != "teacher":
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if model_config.freeze_vision_tower:
@@ -372,6 +428,12 @@ class FSDPWorker(Worker):
             if self._use_optimizer_offload:
                 offload_fsdp_optimizer(optimizer=self.optimizer)
                 print_gpu_memory_usage(f"After offload {role} optimizer during init")
+        elif role == "teacher":
+            self.teacher_fsdp_module = fsdp_module
+            # Keep only one model's forward weights resident during scoring/update.
+            if self._use_teacher_param_offload:
+                offload_fsdp_model(self.teacher_fsdp_module)
+                print_gpu_memory_usage("After offload teacher model during init")
         else:
             self.ref_fsdp_module = fsdp_module
             if self._use_ref_param_offload:
@@ -458,6 +520,22 @@ class FSDPWorker(Worker):
         if self._has_rollout:  # must after actor
             self._build_rollout()
 
+        if self._has_teacher:
+            self._build_model_optimizer(
+                model_config=self.config.teacher.model,
+                fsdp_config=self.config.teacher.fsdp,
+                optim_config=None,
+                padding_free=self.config.teacher.padding_free,
+                role="teacher",
+            )
+            from .actor.dp_actor import DataParallelPPOActor
+
+            self.teacher_policy = DataParallelPPOActor(config=self.config.teacher, actor_module=self.teacher_fsdp_module)
+            teacher_params = list(self.teacher_fsdp_module.parameters())
+            optimizer_param_ids = {id(param) for group in self.optimizer.param_groups for param in group["params"]}
+            if any(param.requires_grad or id(param) in optimizer_param_ids for param in teacher_params):
+                raise RuntimeError("Frozen OPD Teacher must have no gradients and no optimizer parameters.")
+
         if self._has_ref:
             from .actor.dp_actor import DataParallelPPOActor  # lazy import
 
@@ -500,14 +578,16 @@ class FSDPWorker(Worker):
         if self._use_optimizer_offload:  # avoid OOM in resuming
             offload_fsdp_optimizer(self.optimizer)
 
-    def _process_multi_modal_inputs(self, data: DataProto):
+    def _process_multi_modal_inputs(self, data: DataProto, processor=None, cache_key: str = "multi_modal_inputs"):
         if "multi_modal_data" not in data.non_tensor_batch:
             return
+
+        processor = processor or self.processor
 
         if "uid" in self._cache and not np.all(data.non_tensor_batch["uid"] == self._cache["uid"]):
             self._cache.clear()
 
-        if "multi_modal_inputs" not in self._cache:
+        if cache_key not in self._cache:
             min_pixels = data.meta_info["min_pixels"]
             max_pixels = data.meta_info["max_pixels"]
             video_fps = data.meta_info["video_fps"]
@@ -517,24 +597,36 @@ class FSDPWorker(Worker):
                 data.non_tensor_batch["uid"], data.non_tensor_batch["multi_modal_data"]
             ):  # process multi modal data per sample
                 if index not in multi_modal_inputs_cache:
-                    images, videos = [], []
+                    images, videos, video_metadata = [], [], []
                     if "images" in multi_modal_data:
                         for image in multi_modal_data["images"]:
                             images.append(process_image(image, min_pixels, max_pixels))
 
                     if "videos" in multi_modal_data:
                         for video in multi_modal_data["videos"]:
-                            videos.append(process_video(video, min_pixels, max_pixels, video_fps))
+                            processed_video, metadata = process_video(
+                                video, min_pixels, max_pixels, video_fps, return_metadata=True
+                            )
+                            videos.append(processed_video)
+                            video_metadata.append(metadata)
 
                     if len(images) != 0:
                         # it's necessary to add `dict` to properly convert batch features to dict
                         # otherwise the batch features will be converted to dict keys
                         # see https://github.com/hiyouga/EasyR1/pull/339
-                        multi_modal_inputs = dict(self.processor.image_processor(images=images, return_tensors="pt"))
+                        multi_modal_inputs = dict(processor.image_processor(images=images, return_tensors="pt"))
                     elif len(videos) != 0:
-                        multi_modal_inputs = dict(
-                            self.processor.image_processor(images=None, videos=videos, return_tensors="pt")
-                        )
+                        if "Qwen3VLProcessor" in type(processor).__name__:
+                            multi_modal_inputs = dict(
+                                processor.video_processor(
+                                    videos=videos, video_metadata=video_metadata, return_tensors="pt",
+                                    do_resize=os.getenv("EASYR1_VIDEO_OPD_PREPROCESS") != "1",
+                                )
+                            )
+                        else:
+                            multi_modal_inputs = dict(
+                                processor.image_processor(images=None, videos=videos, return_tensors="pt")
+                            )
                     else:
                         multi_modal_inputs = {}
 
@@ -543,9 +635,9 @@ class FSDPWorker(Worker):
                 batch_multi_modal_inputs.append(multi_modal_inputs_cache[index])
 
             self._cache["uid"] = data.non_tensor_batch["uid"]
-            self._cache["multi_modal_inputs"] = np.array(batch_multi_modal_inputs, dtype=object)
+            self._cache[cache_key] = np.array(batch_multi_modal_inputs, dtype=object)
 
-        data.non_tensor_batch["multi_modal_inputs"] = self._cache["multi_modal_inputs"]
+        data.non_tensor_batch["multi_modal_inputs"] = self._cache[cache_key]
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -693,6 +785,58 @@ class FSDPWorker(Worker):
 
         output = output.to("cpu")
         return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @torch.no_grad()
+    def compute_teacher_log_probs(self, data: DataProto):
+        """Score only the student-sampled response tokens under the frozen video Teacher."""
+        if not self._has_teacher:
+            raise RuntimeError("Teacher scoring requires Vanilla OPD mode.")
+        if "multi_modal_data" in data.non_tensor_batch:
+            self._process_multi_modal_inputs(data)
+            student_inputs = self._cache["multi_modal_inputs"]
+            self._process_multi_modal_inputs(data, self.teacher_processor, "teacher_multi_modal_inputs")
+            teacher_inputs = self._cache["teacher_multi_modal_inputs"]
+            if self.rank == 0 and "EASYR1_OPD_DIAGNOSTIC_DIR" in os.environ:
+                print(
+                    "VIDEO_OPD_SCORING_GRIDS student="
+                    f"{student_inputs[0].get('video_grid_thw')} teacher={teacher_inputs[0].get('video_grid_thw')}",
+                    flush=True,
+                )
+            # The same input_ids/position_ids are reused: changed visual features or grids
+            # would silently make teacher forcing condition on a different video/image.
+            for student_item, teacher_item in zip(student_inputs, teacher_inputs):
+                if student_item.keys() != teacher_item.keys():
+                    raise ValueError("OPD student/teacher multimodal input keys differ.")
+                for key in student_item:
+                    student_value, teacher_value = student_item[key], teacher_item[key]
+                    if isinstance(student_value, torch.Tensor):
+                        if not isinstance(teacher_value, torch.Tensor) or not torch.equal(student_value, teacher_value):
+                            raise ValueError(f"OPD student/teacher multimodal tensor {key} differs.")
+                    elif student_value != teacher_value:
+                        raise ValueError(f"OPD student/teacher multimodal value {key} differs.")
+
+        data = data.to(torch.cuda.current_device())
+        if self._use_teacher_param_offload:
+            load_fsdp_model(self.teacher_fsdp_module)
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        self.teacher_fsdp_module.eval()
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            log_probs = self.teacher_policy.compute_log_prob(data=data).detach()
+            if log_probs.shape != data.batch["responses"].shape:
+                raise ValueError("OPD Teacher log-prob shape differs from responses.")
+            mask = data.batch["response_mask"].bool()
+            if not mask.any() or not torch.isfinite(log_probs[mask]).all():
+                raise ValueError("OPD Teacher has no valid or finite sampled-token log-probs.")
+            output = DataProto.from_dict(tensors={"teacher_log_probs": log_probs})
+            output = self.ulysses_sharding_manager.postprocess_data(output)
+
+        if self.world_size > 1:
+            self.teacher_fsdp_module._handle.reshard(True)
+        if self._use_teacher_param_offload:
+            offload_fsdp_model(self.teacher_fsdp_module)
+        return output.to("cpu")
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):

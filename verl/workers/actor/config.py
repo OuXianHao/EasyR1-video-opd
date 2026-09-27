@@ -138,6 +138,7 @@ class ActorConfig:
     use_kl_loss: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
+    opd_enabled: bool = field(default=False, init=False)
 
 
 @dataclass
@@ -151,3 +152,11 @@ class RefConfig:
     dynamic_batching: bool = field(default=False, init=False)
     ulysses_size: int = field(default=1, init=False)
     use_torch_compile: bool = field(default=True, init=False)
+
+
+@dataclass
+class TeacherConfig(RefConfig):
+    """Independent frozen scorer for sampled-token OPD, not the KL reference."""
+
+    model: ModelConfig = field(default_factory=ModelConfig)
+    offload: OffloadConfig = field(default_factory=lambda: OffloadConfig(offload_params=True))

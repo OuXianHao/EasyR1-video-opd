@@ -102,7 +102,7 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     num_overall_tokens = sum(batch.meta_info["global_token_num"])
     num_tokens_of_section = {
         **dict.fromkeys(["gen", "reward"], num_response_tokens),
-        **dict.fromkeys(["ref", "old", "values", "adv", "update_critic", "update_actor"], num_overall_tokens),
+        **dict.fromkeys(["ref", "old", "teacher", "values", "adv", "update_critic", "update_actor"], num_overall_tokens),
     }
     return {
         **{f"timing_s/{name}": value for name, value in timing_raw.items()},

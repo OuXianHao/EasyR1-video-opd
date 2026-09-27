@@ -16,12 +16,14 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface.
 """
 
+import csv
 import json
 import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import IntEnum, auto
 from typing import Any, Optional, Type
 
@@ -59,6 +61,20 @@ from .metrics import (
     compute_timing_metrics,
     reduce_metrics,
 )
+from .reasoning_diagnostics import analyze_response
+
+
+def _sampled_ppu_peak(path: str, started: str, ended: str) -> dict[int, int]:
+    """Read the run's 2-second memory monitor for this step's sampled peak."""
+    if not path or not os.path.exists(path):
+        return {}
+    peaks = {}
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            if started <= row["time_utc"] <= ended:
+                index, mib = int(row["ppu"]), int(row["memory_mib"])
+                peaks[index] = max(peaks.get(index, 0), mib)
+    return peaks
 
 
 class Role(IntEnum):
@@ -200,7 +216,7 @@ class RayPPOTrainer:
             self.use_reference_policy = True
             self.kl_ctrl = get_kl_controller(config.algorithm)
 
-        if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        if config.algorithm.adv_estimator == AdvantageEstimator.GAE and not config.algorithm.opd.enabled:
             self.use_critic = True
         else:
             self.use_critic = False
@@ -230,7 +246,8 @@ class RayPPOTrainer:
                 )
 
         if (
-            config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
+            not config.algorithm.opd.enabled
+            and config.algorithm.adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.RLOO)
             and config.worker.rollout.n == 1
         ):
             raise ValueError("GRPO and RLOO algorithm need `config.worker.rollout.n > 1`.")
@@ -582,10 +599,23 @@ class RayPPOTrainer:
                 return
 
         self.data_iterator = iter(self.train_dataloader)
+        checkpoint_steps = {
+            int(value) for value in os.getenv("EASYR1_OPD_CHECKPOINT_STEPS", "").split(",") if value.strip()
+        }
+        if any(step < 1 or step > self.training_steps for step in checkpoint_steps):
+            raise ValueError(f"Invalid OPD checkpoint steps: {checkpoint_steps}")
+        last_checkpoint_step = None
+        cumulative_responses = cumulative_truncated = 0
+        truncation_warning_emitted = False
+        gradient_history = []
         while self.global_step < self.training_steps:
             self.global_step += 1
 
             metrics, timing_raw = {}, {}
+            step_start_utc = datetime.now(timezone.utc).isoformat()
+            step_samples = []
+            step_lengths, step_reasoning_counts, step_answer_counts = [], [], []
+            step_visual_tokens, step_frame_counts = [], []
             with timer("step", timing_raw):
                 # make a batch of data
                 with timer("gen", timing_raw):
@@ -602,7 +632,7 @@ class RayPPOTrainer:
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                 # compute reward
-                if "token_level_scores" not in batch.batch:
+                if not self.config.algorithm.opd.enabled and "token_level_scores" not in batch.batch:
                     with timer("reward", timing_raw):
                         reward_ref = self.reward_fn.compute_reward.remote(batch)
 
@@ -611,8 +641,149 @@ class RayPPOTrainer:
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
 
+                if self.config.algorithm.opd.enabled:
+                    with timer("teacher", timing_raw):
+                        teacher_log_probs = self.actor_rollout_ref_wg.compute_teacher_log_probs(batch)
+                        batch = batch.union(teacher_log_probs)
+                    expected_shape = batch.batch["responses"].shape
+                    for key in ("response_mask", "old_log_probs", "teacher_log_probs"):
+                        if key not in batch.batch or batch.batch[key].shape != expected_shape:
+                            raise ValueError(f"Vanilla OPD requires {key} with shape {expected_shape}.")
+                    mask = batch.batch["response_mask"].bool()
+                    delta_tensor = batch.batch["teacher_log_probs"] - batch.batch["old_log_probs"]
+                    delta = delta_tensor[mask].float()
+                    if not torch.isfinite(delta).all():
+                        raise ValueError("OPD found non-finite teacher-student delta.")
+                    if not delta.numel():
+                        raise ValueError("OPD response mask contains no valid tokens.")
+
+                    video_token_id = getattr(self.processor, "video_token_id", None)
+                    if video_token_id is not None:
+                        step_visual_tokens = (batch.batch["prompts"] == video_token_id).sum(-1).tolist()
+                    multimodal = batch.non_tensor_batch.get("multi_modal_data")
+                    if multimodal is not None:
+                        for item in multimodal:
+                            videos = item.get("videos", []) if isinstance(item, dict) else []
+                            step_frame_counts.append(len(videos[0]) if videos else 0)
+                    high_min = int(os.getenv("EASYR1_OPD_VISUAL_TOKEN_MIN", "0"))
+                    prompt_lengths = batch.batch["attention_mask"][:, :-self.config.data.max_response_length].sum(-1).tolist()
+                    if high_min and (len(step_visual_tokens) != len(batch) or
+                                     min(step_visual_tokens) < high_min or
+                                     len(step_frame_counts) != len(batch) or
+                                     any(count != 32 for count in step_frame_counts) or
+                                     max(prompt_lengths) >= self.config.data.max_prompt_length):
+                        raise ValueError(f"Reasoning OPD High input failed: visual={step_visual_tokens}, "
+                                         f"frames={step_frame_counts}, prompt_lengths={prompt_lengths}")
+
+                    analyzed = []
+                    sample_ids = batch.non_tensor_batch.get("sample_id", list(range(len(batch))))
+                    for i in range(len(batch)):
+                        valid_indices = mask[i].nonzero(as_tuple=True)[0].tolist()
+                        token_ids = [int(batch.batch["responses"][i, j]) for j in valid_indices]
+                        token_delta = [float(delta_tensor[i, j]) for j in valid_indices]
+                        summary = analyze_response(self.tokenizer, token_ids, token_delta)
+                        analyzed.append((valid_indices, summary))
+                        step_samples.append(str(sample_ids[i]))
+                        step_lengths.append(summary["response_tokens"])
+                        step_reasoning_counts.append(summary["reasoning_tokens"])
+                        step_answer_counts.append(summary["answer_tokens"])
+
+                    max_response = self.config.data.max_response_length
+                    truncated = sum(length >= max_response for length in step_lengths)
+                    cumulative_responses += len(step_lengths)
+                    cumulative_truncated += truncated
+                    cumulative_rate = cumulative_truncated / cumulative_responses
+                    metrics.update({
+                        "response_length/median": float(np.median(step_lengths)),
+                        "response_length/p95": float(np.percentile(step_lengths, 95)),
+                        "response_length/truncated_count": truncated,
+                        "response_length/cumulative_truncated_count": cumulative_truncated,
+                        "response_length/cumulative_truncation_rate": cumulative_rate,
+                        "reasoning_tokens/count": sum(step_reasoning_counts),
+                        "reasoning_tokens/mean_per_response": float(np.mean(step_reasoning_counts)),
+                        "answer_tokens/count": sum(step_answer_counts),
+                        "actor/grad_clip_threshold": self.config.worker.actor.max_grad_norm,
+                    })
+                    if step_visual_tokens:
+                        metrics.update({
+                            "visual_tokens/min": min(step_visual_tokens),
+                            "visual_tokens/mean": float(np.mean(step_visual_tokens)),
+                            "visual_tokens/max": max(step_visual_tokens),
+                        })
+                    if step_frame_counts:
+                        metrics.update({"frame_count/min": min(step_frame_counts),
+                                        "frame_count/max": max(step_frame_counts)})
+                    if cumulative_rate > .05 and not truncation_warning_emitted:
+                        print(f"WARNING: cumulative reasoning response truncation rate "
+                              f"{cumulative_rate:.2%} exceeds 5% at step {self.global_step}.", flush=True)
+                        truncation_warning_emitted = True
+
+                    diagnostic_dir = os.getenv("EASYR1_OPD_DIAGNOSTIC_DIR")
+                    diagnostic_every = int(os.getenv("EASYR1_OPD_DIAGNOSTIC_EVERY", "1"))
+                    save_diagnostic = diagnostic_dir and (self.global_step % diagnostic_every == 0 or
+                                     (self.global_step == 1 and os.getenv("EASYR1_OPD_DIAGNOSTIC_FIRST") == "1") or
+                                     self.global_step == self.training_steps)
+                    if save_diagnostic:
+                        os.makedirs(diagnostic_dir, exist_ok=True)
+                        quantiles = torch.quantile(delta, torch.tensor([.01, .05, .25, .5, .75, .95, .99]))
+                        diagnostic = {
+                            "step": self.global_step,
+                            "delta": {
+                                "count": delta.numel(), "mean": delta.mean().item(),
+                                "std": delta.std(unbiased=False).item(), "min": delta.min().item(),
+                                "max": delta.max().item(),
+                                "positive_fraction": (delta > 0).float().mean().item(),
+                                "negative_fraction": (delta < 0).float().mean().item(),
+                                **{key: value.item() for key, value in zip(
+                                    ("p1", "p5", "p25", "p50", "p75", "p95", "p99"), quantiles
+                                )},
+                            }, "samples": [],
+                        }
+                        if "vllm_log_probs" in batch.batch:
+                            mismatch = (batch.batch["vllm_log_probs"] - batch.batch["old_log_probs"])[mask].abs().float()
+                            mismatch_quantiles = torch.quantile(mismatch, torch.tensor([.5, .95, .99]))
+                            diagnostic["vllm_fsdp_abs_diff"] = {
+                                "count": mismatch.numel(), "mean": mismatch.mean().item(),
+                                "median": mismatch_quantiles[0].item(), "p95": mismatch_quantiles[1].item(),
+                                "p99": mismatch_quantiles[2].item(), "max": mismatch.max().item(),
+                            }
+                        limit = int(os.getenv("EASYR1_OPD_DIAGNOSTIC_SAMPLES", "0")) or len(batch)
+                        for i in range(min(limit, len(batch))):
+                            valid_indices, summary = analyzed[i]
+                            tokens = []
+                            for j in valid_indices:
+                                token_id = batch.batch["responses"][i, j].item()
+                                item = {
+                                    "position": j, "token_id": token_id,
+                                    "token_text": self.tokenizer.decode([token_id], skip_special_tokens=False),
+                                    "old_log_prob": batch.batch["old_log_probs"][i, j].item(),
+                                    "teacher_log_prob": batch.batch["teacher_log_probs"][i, j].item(),
+                                }
+                                item["delta"] = item["teacher_log_prob"] - item["old_log_prob"]
+                                if "vllm_log_probs" in batch.batch:
+                                    item["vllm_log_prob"] = batch.batch["vllm_log_probs"][i, j].item()
+                                tokens.append(item)
+                            question = batch.non_tensor_batch.get("question")
+                            options = batch.non_tensor_batch.get("options")
+                            ground_truth = batch.non_tensor_batch.get("ground_truth")
+                            diagnostic["samples"].append({
+                                "sample_id": step_samples[i],
+                                "question": str(question[i]) if question is not None else None,
+                                "options": [str(x) for x in options[i]] if options is not None else None,
+                                "ground_truth": str(ground_truth[i]) if ground_truth is not None else None,
+                                "response_text": summary["response_text"],
+                                "final_answer": summary["final_answer"],
+                                "response_tokens": summary["response_tokens"],
+                                "reasoning_tokens": summary["reasoning_tokens"],
+                                "answer_tokens": summary["answer_tokens"],
+                                "delta_by_region": summary["delta_by_region"],
+                                "tokens": tokens,
+                            })
+                        with open(os.path.join(diagnostic_dir, f"step_{self.global_step}.json"), "w") as f:
+                            json.dump(diagnostic, f, ensure_ascii=False, indent=2)
+
                 # compute ref_log_probs
-                if self.use_reference_policy:
+                if self.use_reference_policy and not self.config.algorithm.opd.enabled:
                     with timer("ref", timing_raw):
                         ref_log_probs = self.actor_rollout_ref_wg.compute_ref_log_probs(batch)
                         batch = batch.union(ref_log_probs)
@@ -623,29 +794,30 @@ class RayPPOTrainer:
                         values = self.critic_wg.compute_values(batch)
                         batch = batch.union(values)
 
-                with timer("adv", timing_raw):
-                    if "token_level_scores" not in batch.batch:
-                        # get token level scores asynchronously
-                        reward_tensor, reward_metrics = ray.get(reward_ref)
-                        batch.batch["token_level_scores"] = reward_tensor
-                        reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
-                        metrics.update(reward_metrics)
+                if not self.config.algorithm.opd.enabled:
+                    with timer("adv", timing_raw):
+                        if "token_level_scores" not in batch.batch:
+                            # get token level scores asynchronously
+                            reward_tensor, reward_metrics = ray.get(reward_ref)
+                            batch.batch["token_level_scores"] = reward_tensor
+                            reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
+                            metrics.update(reward_metrics)
 
-                    # apply kl penalty if available
-                    if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                        # apply kl penalty to reward
-                        batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
-                        metrics.update(kl_metrics)
-                    else:
-                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        # apply kl penalty if available
+                        if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                            # apply kl penalty to reward
+                            batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
+                            metrics.update(kl_metrics)
+                        else:
+                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                    # compute advantages, executed on the driver process
-                    batch = compute_advantage(
-                        batch,
-                        adv_estimator=self.config.algorithm.adv_estimator,
-                        gamma=self.config.algorithm.gamma,
-                        lam=self.config.algorithm.lam,
-                    )
+                        # compute advantages, executed on the driver process
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                        )
 
                 # update critic
                 if self.use_critic:
@@ -656,12 +828,33 @@ class RayPPOTrainer:
                     metrics.update(critic_metrics)
 
                 # update actor
-                if self.config.trainer.critic_warmup <= self.global_step:
+                if self.config.trainer.critic_warmup <= self.global_step and (
+                    not self.config.algorithm.opd.enabled or os.getenv("EASYR1_OPD_QUALIFY_ONLY") != "1"
+                ):
                     with timer("update_actor", timing_raw):
                         actor_output = self.actor_rollout_ref_wg.update_actor(batch)
 
                     actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                     metrics.update(actor_metrics)
+                    if self.config.algorithm.opd.enabled:
+                        for name in ("opd/loss", "opd/reward_mean", "opd/reward_std", "actor/grad_norm"):
+                            if name not in metrics or not np.isfinite(metrics[name]):
+                                raise FloatingPointError(f"Reasoning OPD non-finite or missing {name} at step "
+                                                         f"{self.global_step}: {metrics.get(name)}")
+                        if metrics.get("opd/optimizer_step") != 1:
+                            raise FloatingPointError(f"Reasoning OPD optimizer did not update at step {self.global_step}")
+                        gradient_history.append((float(metrics["actor/grad_norm"]),
+                                                 float(metrics["opd/loss"]),
+                                                 float(metrics["opd/reward_mean"])))
+                        if len(gradient_history) >= 3:
+                            (g1, l1, r1), (g2, _, _), (g3, l3, r3) = gradient_history[-3:]
+                            if (g3 >= 1e4 and g2 >= 8 * max(g1, 1) and g3 >= 8 * max(g2, 1) and
+                                abs(l3) >= 5 * max(abs(l1), .1) and
+                                abs(r3) >= 5 * max(abs(r1), .1)):
+                                raise FloatingPointError(
+                                    f"Reasoning OPD gradient and loss/reward drift at step {self.global_step}: "
+                                    f"grad={g1:.3g},{g2:.3g},{g3:.3g}; loss={l1:.3g},{l3:.3g}"
+                                )
 
                 # validate
                 if (
@@ -674,21 +867,53 @@ class RayPPOTrainer:
 
                     metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
+                if (self.global_step in checkpoint_steps or
+                    (self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0)):
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
+                    last_checkpoint_step = self.global_step
 
             # collect metrics
+            step_end_utc = datetime.now(timezone.utc).isoformat()
+            memory_peaks = _sampled_ppu_peak(os.getenv("EASYR1_OPD_MEMORY_CSV", ""),
+                                             step_start_utc, step_end_utc)
+            if memory_peaks:
+                metrics["ppu/peak_memory_mib_sampled"] = max(memory_peaks.values())
+                metrics["ppu/min_rank_peak_memory_mib_sampled"] = min(memory_peaks.values())
             num_gpus = self.resource_pool_manager.get_num_gpus()
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            if self.config.algorithm.opd.enabled:
+                metrics.update(compute_length_metrics(batch))
+            else:
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=num_gpus))
+
+            step_health_path = os.getenv("EASYR1_OPD_STEP_HEALTH_PATH")
+            if step_health_path and self.config.algorithm.opd.enabled:
+                os.makedirs(os.path.dirname(step_health_path), exist_ok=True)
+                with open(step_health_path, "a") as f:
+                    json.dump({
+                        "step": self.global_step, "start_utc": step_start_utc, "end_utc": step_end_utc,
+                        "sample_ids": step_samples, "response_lengths": step_lengths,
+                        "reasoning_token_counts": step_reasoning_counts,
+                        "answer_token_counts": step_answer_counts,
+                        "visual_token_counts": step_visual_tokens, "frame_counts": step_frame_counts,
+                        "truncation_count": metrics.get("response_length/truncated_count"),
+                        "cumulative_truncation_rate": metrics.get("response_length/cumulative_truncation_rate"),
+                        "loss": metrics.get("opd/loss"), "reward_mean": metrics.get("opd/reward_mean"),
+                        "reward_std": metrics.get("opd/reward_std"),
+                        "grad_norm_pre_clip": metrics.get("actor/grad_norm"),
+                        "grad_clip_threshold": self.config.worker.actor.max_grad_norm,
+                        "learning_rate": metrics.get("actor/lr"),
+                        "timing_s": timing_raw, "ppu_memory_peak_mib_sampled": memory_peaks,
+                    }, f, ensure_ascii=False)
+                    f.write("\n")
 
             self.logger.log(data=metrics, step=self.global_step)
             main_tqdm.update()
 
         # perform validation after training
-        if self.val_reward_fn is not None:
+        if self.val_reward_fn is not None and self.config.trainer.run_final_validation:
             if (
                 val_metrics is None
                 or self.config.trainer.val_freq <= 0
@@ -699,5 +924,5 @@ class RayPPOTrainer:
 
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+        if self.config.trainer.save_final_checkpoint and last_checkpoint_step != self.global_step:
             self._save_checkpoint()

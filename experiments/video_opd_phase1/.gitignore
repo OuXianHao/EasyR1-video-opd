@@ -1,0 +1,22 @@
+# Default: ignore everything generated in this experiment workspace
+*
+
+# Allow Git to traverse directories
+!*/
+
+# Keep source code and launch scripts
+!*.py
+!*.sh
+
+# Keep necessary configs
+!*.yaml
+!*.yml
+!*.toml
+!high.env
+!medium.env
+
+# Keep documentation only when explicitly intended
+!README.md
+
+# Keep this ignore file
+!.gitignore

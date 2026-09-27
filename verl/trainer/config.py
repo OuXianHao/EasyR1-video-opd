@@ -64,6 +64,11 @@ class DataConfig:
 
 @dataclass
 class AlgorithmConfig:
+    @dataclass
+    class OPDConfig:
+        enabled: bool = False
+
+    opd: OPDConfig = field(default_factory=OPDConfig)
     gamma: float = 1.0
     """discount factor for ppo gae advantage estimator"""
     lam: float = 1.0
@@ -118,12 +123,16 @@ class TrainerConfig:
     """validation frequency, -1 means no validation"""
     val_before_train: bool = True
     """validate before training"""
+    run_final_validation: bool = True
+    """run a final validation pass after training; disable for short smoke runs"""
     val_only: bool = False
     """validate only, skip training"""
     val_generations_to_log: int = 0
     """number of generations to log for validation"""
     save_freq: int = -1
     """save frequency, -1 means no saving"""
+    save_final_checkpoint: bool = True
+    """save a final checkpoint after training; disable for short smoke runs"""
     save_limit: int = -1
     """max number of checkpoints to save, -1 means no limit"""
     save_model_only: bool = False
@@ -153,6 +162,25 @@ class PPOConfig:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
 
     def post_init(self):
+        if self.algorithm.opd.enabled:
+            if not self.worker.teacher.model.model_path:
+                raise ValueError("Vanilla OPD requires worker.teacher.model.model_path.")
+            if self.worker.rollout.n != 1:
+                raise ValueError("Vanilla OPD requires rollout.n=1.")
+            if (self.worker.rollout.temperature, self.worker.rollout.top_p, self.worker.rollout.top_k) != (1.0, 1.0, -1):
+                raise ValueError("Vanilla OPD requires temperature=1, top_p=1, top_k=-1.")
+            if self.worker.actor.ppo_epochs != 1:
+                raise ValueError("Vanilla OPD requires actor.ppo_epochs=1.")
+            if self.worker.actor.global_batch_size != self.data.rollout_batch_size:
+                raise ValueError("Vanilla OPD requires one actor global batch per rollout batch.")
+            if self.algorithm.online_filtering or self.algorithm.adv_estimator == "remax":
+                raise ValueError("Vanilla OPD does not support reward-based filtering or remax rollouts.")
+            if self.trainer.critic_warmup:
+                raise ValueError("Vanilla OPD cannot skip its sole actor update for critic warmup.")
+            # Pure OPD has no KL reference; the Teacher has a separate checkpoint and role.
+            self.algorithm.disable_kl = True
+            self.algorithm.use_kl_loss = False
+            self.worker.actor.opd_enabled = True
         self.worker.rollout.prompt_length = self.data.max_prompt_length
         self.worker.rollout.response_length = self.data.max_response_length
         self.worker.rollout.trust_remote_code = self.worker.actor.model.trust_remote_code

@@ -182,3 +182,13 @@ tensorboard_log/
 # data
 images/
 images*
+
+# Research model artifacts
+*.pth
+*.ckpt
+*.safetensors
+
+# Experiment runtime artifacts
+ray_results/
+ray_tmp/
+logs/

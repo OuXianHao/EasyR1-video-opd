@@ -12,12 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from importlib.metadata import version
 from typing import List
 
 from msgspec import field
 from packaging import version as vs
-from vllm.lora.models import LoRAModel
+try:
+    from vllm.lora.models import LoRAModel
+except ModuleNotFoundError as exc:
+    if exc.name != "vllm.lora.models":
+        raise
+    # vLLM 0.14 moved LoRAModel; keep the older import for existing CUDA environments.
+    from vllm.lora.lora_model import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
@@ -31,6 +38,10 @@ class TensorLoRARequest(LoRARequest):
 class VLLMHijack:
     @staticmethod
     def hijack():
+        original_load_adapter = LRUCacheWorkerLoRAManager._load_adapter
+        if getattr(original_load_adapter, "_easyr1_hijack", False):
+            return
+
         def hijack__load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
             """
             based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors
@@ -38,6 +49,12 @@ class VLLMHijack:
             VLLM does not support adding LoRA from tensors directly. It only supports adding LoRA via file paths.
             To synchronize the LoRA tensors of the actor model, we need to find a workaround to enable VLLM to load memory-based LoRA tensors.
             """
+            # vLLM 0.14 changed the checkpoint loader signature; let it load ordinary adapters itself.
+            if not isinstance(lora_request, TensorLoRARequest) and "model_vocab_size" in inspect.signature(
+                self._lora_model_cls.from_local_checkpoint
+            ).parameters:
+                return original_load_adapter(self, lora_request)
+
             supported_lora_modules = self._adapter_manager.supported_lora_modules
             packed_modules_mapping = self._adapter_manager.packed_modules_mapping
             expected_lora_modules: List[str] = []
@@ -73,18 +90,25 @@ class VLLMHijack:
                 hf_to_vllm_mapper = model.hf_to_vllm_mapper
 
             if isinstance(lora_request, TensorLoRARequest):
-                lora = self._lora_model_cls.from_lora_tensors(
+                load_kwargs = dict(
                     lora_model_id=lora_request.lora_int_id,
                     tensors=lora_tensors,
                     peft_helper=peft_helper,
                     device="cpu",
                     dtype=self.lora_config.lora_dtype,
-                    embeddings=None,
-                    target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
-                    embedding_modules=self.embedding_modules,
-                    embedding_padding_modules=self.embedding_padding_modules,
                     weights_mapper=hf_to_vllm_mapper,
                 )
+                if "model_vocab_size" in inspect.signature(self._lora_model_cls.from_lora_tensors).parameters:
+                    # vLLM 0.14 removed the embedding padding arguments.
+                    load_kwargs["model_vocab_size"] = self.vocab_size
+                else:
+                    load_kwargs.update(
+                        embeddings=None,
+                        target_embedding_padding=self.vocab_size + self.lora_config.lora_extra_vocab_size,
+                        embedding_modules=self.embedding_modules,
+                        embedding_padding_modules=self.embedding_padding_modules,
+                    )
+                lora = self._lora_model_cls.from_lora_tensors(**load_kwargs)
             else:
                 lora = self._lora_model_cls.from_local_checkpoint(
                     lora_path,
@@ -99,7 +123,7 @@ class VLLMHijack:
                     weights_mapper=hf_to_vllm_mapper,
                 )
 
-            if lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
+            if hasattr(lora, "extra_vocab_size") and lora.extra_vocab_size > self.lora_config.lora_extra_vocab_size:
                 raise ValueError(
                     f"LoRA added vocab size {lora.extra_vocab_size} "
                     f"is greater than lora_extra_vocab_size "
@@ -107,6 +131,7 @@ class VLLMHijack:
                 )
             return lora
 
+        hijack__load_adapter._easyr1_hijack = True
         setattr(LRUCacheWorkerLoRAManager, "_load_adapter", hijack__load_adapter)
 
         if vs.parse(version("vllm")).base_version == "0.11.0":
